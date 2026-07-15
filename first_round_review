@@ -1,0 +1,59 @@
+Done — and the analyst's comparison workbook turned out to be extremely useful. It let me verify the engine against 5,176 real entities (50 States, 4,081 Munis, 1,045 Counties), and it confirmed some of my earlier findings while correcting one. The good news first: **every headroom amount and percentage the tool computed reconciles exactly with the analyst's manual Excel calculations** — the core math is right. The discrepancies are all at the edges, and they're exactly where I predicted: terminal ladder levels and NA handling.
+
+One correction to my own earlier review, in fairness: I previously said NA scores would crash the engine with a subscript error. The workbook proves otherwise — because the replacement value is length-1, R silently skips NA logical indices. So it doesn't crash; instead it produces misleading output (see ENG-2 below). The comments reflect the corrected behavior.
+
+Quick reconciliation with the old headroom thread: the original Corporate tool was a flat tidyverse script hard-wired to two ratios, and the FI/Insurance proposals showed every new criteria needs different ladder shapes (caps, strict boundaries, different terminal levels). CREST's YAML+R6 design is the right answer, but the engine still hard-codes three things the proposals said must be config-driven — terminal levels (`score == 6`), category cutoffs (0.30/0.60), and operator semantics. Those are ENG-1, ENG-4, ENG-5 below. Also, the old `!!paste0() :=` dynamic-naming bug we fixed has a spiritual successor in ENG-7.
+
+Here are the review comments, formatted for ADO. Severity tags: 🔴 must-fix (wrong results), 🟠 should-fix (correctness risk), 🟡 improvement.
+
+---
+
+## Repo: crest-engine
+
+**ENG-1** 🔴 `R/tool_engine.R:226-228` — Terminal-level logic is hard-coded to `score == 6`, producing wrong "Safe" statuses. **Confirmed against analyst validation data:** 26 Municipalities and 9 Counties at Reserves score 5 (the `<` rung with `range: NA`) get `status = "Safe"` and `headroom_category = NA`, including entities with deeply negative reserves (e.g., −61%, −130% of revenues). The analyst's manual calc correctly marks all of these "At the lowest level." Same defect affects States Reserves, whose ladder terminates at score 4. Fix: mark terminal levels explicitly in the YAML (e.g., `terminal: true`, or treat `range: NA` as terminal) and have the engine assign a proper "no headroom calculation" status instead of keying on the literal 6.
+
+**ENG-2** 🔴 `R/tool_engine.R:190-228` — Rows with NA score produce inconsistent output: `status = "Unknown"` but `headroom_category = "At the lowest level"` (the initialization default at line 190 leaking through, since `valid_mask` excludes them and the score-6 override skips NA). Confirmed in validation data (1 Muni with missing Reserves score). The default category string should not double as both "no matching threshold" and "at lowest level" — initialize category to NA or "Unknown" and set "At the lowest level" only via the explicit terminal branch.
+
+**ENG-3** 🔴 `R/tool_engine.R:199-215` — Operator `"NA"` (used at score 6 in the Counties/Munis Reserves ladders) is unhandled: it falls through `is_safe = FALSE`, so status would be "Breached" if the score-6 override didn't happen to mask it. Any future criteria using a non-6 terminal with operator NA will emit "Breached" for entities that are simply at the floor. Fix together with ENG-1: terminal rungs should never enter the Safe/Breached logic.
+
+**ENG-4** 🟠 `R/tool_engine.R:209-213` — Strict operators are evaluated inclusively: `<` uses `<=` and `>` uses `>=`. Boundary values (entity exactly at threshold) are misclassified. Either implement all four operators faithfully or restrict the YAML vocabulary to `<=`/`>=` and validate at load time.
+
+**ENG-5** 🟠 `R/tool_engine.R:221-222` — Category cutoffs 0.30/0.60 are hard-coded, contradicting the design doc ("Category Thresholds" belong in YAML) and blocking criteria whose Low/Moderate/High bands differ. Move to config with these as defaults. Note also: a breached row (negative `hp_pct`) currently falls into "Low" — consider a distinct "Breached" category so portfolio aggregations don't mix breached credits with low-headroom ones.
+
+**ENG-6** 🟠 `R/tool_engine.R:218` — Sign convention is internally inconsistent: on breach, `available_headroom` is flipped positive (`-headroom`) while `headroom_percentage` stays negative. The analyst's manual convention keeps the amount negative on breach. Recommend keeping both signed (negative = breach magnitude) so amount and percentage always agree in sign.
+
+**ENG-7** 🟡 `R/tool_engine.R:63` — `clean_name <- gsub("[[:space:].]+", "_", display_name)` only strips spaces/dots, so output columns contain `%` and `-` (confirmed in tool output: `Budget-based_reserve_as_%_Annual_Revenues_headroom`). Non-syntactic names break bare `select()`/formula usage downstream. Use `make.names()` or extend the regex to `[^A-Za-z0-9]+`.
+
+**ENG-8** 🟠 `R/tool_engine.R:130` — `run_scenario_analysis` validates only the *length* of `scenario_map`, and line 139 silently skips names not found in the data. A typo'd multiplier name silently runs base case for that metric — dangerous for stress testing. Validate `names(scenario_map)` against configured `metric_key`s and error on any mismatch.
+
+**ENG-9** 🟡 `R/tool_engine.R:81,179` — `merge()` re-sorts rows by key on every metric pass, so output row order differs from input; also, duplicate SPIDs would fan out the join silently. Use keyed `on=` joins (or restore original order) and add an assertion that SPID is unique.
+
+**ENG-10** 🟡 `R/tool_engine.R:1` — `Sys.setenv("_R_CHECK_SYSTEM_CLOCK_" = 0)` is a check-time workaround living in package source and executes at install. Move to the check environment/CI config.
+
+**ENG-11** 🟡 `DESCRIPTION` / naming — Package is `crest`, class is `risk.resilience.quantifier`, design deck references `<resq>`. Align before wider rollout. Also: move `R6`, `data.table`, `yaml` from `Depends` to `Imports` (current best practice; `Depends` pollutes the user's search path), and replace the template README.
+
+**ENG-12** 🟡 `tests/` — Existing tests are good but miss exactly the cases the validation data exposed: NA score, terminal non-6 rung (States Reserves score 4, Counties/Munis score 5), operator `"NA"`, boundary values for strict operators, breached-row sign convention, and scenario-map name validation. Recommend adding these as regression tests using the M/C score-5 cases from the analyst workbook as fixtures. Also decide whether `tests/Archive/` should ship in the package.
+
+## Repo: CREST_UI
+
+**UI-1** 🔴 `inst/goModel.yml` — This YAML has diverged from the engine's copy: metric/score keys were renamed to friendly column names here while the package copy (and its tests) use technical keys (`model_inputs.*`). Two "single sources of truth" that have already drifted. Recommend one canonical YAML shipped in the package `inst/` (loaded via `system.file()`), with the key mapping handled in one place.
+
+**UI-2** 🔴 Criteria coverage — The analyst's manual calc scores **four** debt/reserve metrics per the criteria: NDDPC (25%), Cost for Debt & Liabilities (50%), **Net Pension Liabilities Per Capita (25%)**, plus the Debt Initial Score rollup. NPL is absent from both YAMLs and the tool output. Please confirm whether NPL is deferred intentionally; if not, it needs a ladder in the config. (The tool also doesn't compute the weighted Debt Initial Score — confirm whether in scope.)
+
+**UI-3** 🔴 Open question from validation workbook — The States tool output contains no Reserves headroom columns at all (Munis/Counties outputs have them). Was the States run produced before the Reserves config was added, or is the metric being dropped for States at runtime? Note the States Excel side shows several *breached* reserves rows (negative headroom at scores 1–2), which is exactly where ENG-6's sign convention matters — this subsector needs re-validation after fixes.
+
+**UI-4** 🔴 `app.R` (throughout, e.g., 379-381, 389, 456) — Session state via `<<-` into the global environment (`input_data`, `master_report`, `GO_data_*`). In deployed Shiny, globals are shared across concurrent sessions: two analysts using the tool simultaneously can overwrite each other's portfolio selection and see each other's results. Move to `reactiveVal()`/`reactiveValues()` per session.
+
+**UI-5** 🟠 `app.R:388-1130, 1600, 2600, 3610` — The engine-init + scenario-loop block is duplicated six-plus times across the States/Munis/Counties observers and the batch runner. Extract a single `run_headroom(subsector, data, scenarios)` helper; criteria updates currently require six synchronized edits.
+
+**UI-6** 🟠 `app.R` output formatting — Tool reports headroom % as a fraction (0.462) where the analyst convention is percent (46.2), and category labels differ ("High" vs "High Headroom"). Align display formatting (and consider making category labels YAML-driven). Also consider echoing the applied Threshold and Range per metric in the output, as the manual workbook does — analysts clearly use them to verify.
+
+**UI-7** 🟡 `library/headroom_calculator.R` — Dead stub carried over from the old headroom tool; both functions return NA placeholders and nothing sources them. Delete.
+
+**UI-8** 🟡 `app.R:9-55` — Duplicate `library()` calls (`data.table` ×3, `ggplot2` ×2); `ROracle`/`DBI` loaded but all DB reads are commented out; `useShinyalert()` is deprecated in current shinyalert. Clean up the header. `inst/*.rds` also appear to be a dead load path (all `readRDS` calls commented) — remove or document.
+
+**UI-9** 🟡 `utilities/` — `go_fin_data.R` repeats an identical ~40-line pull/rank pipeline three times for hard-coded entities (Guam/Florida/Austin) — parameterize into a function. `go_model_data_insertdata.R:84` has `econ_data <- unlist(rec[c])` — `rec[c]` indexes by the base function `c`, which is almost certainly a leftover typo (harmless only because the result is unused). Both scripts hard-code excluded usernames and output paths — move to config. README is still the untouched template.
+
+---
+
+Bottom line for the PR: the calculation core is validated and solid — the analyst workbook matches it cell-for-cell everywhere a calculation happens. The must-fixes are concentrated in one place: how the engine handles ladder floors and missing data (ENG-1/2/3), which is currently mislabeling distressed credits as "Safe" in production output, plus the config divergence and metric coverage questions (UI-1/2/3). Say the word when you want the corrected `tool_engine.R` and regression tests.
